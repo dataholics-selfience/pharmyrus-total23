@@ -2,17 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy requirements
+# Install dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY . .
 
-# Expose port (Railway will override)
-EXPOSE ${PORT:-8000}
+# Expose port
+EXPOSE 8080
 
-# Run application
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Start with Railway PORT
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
