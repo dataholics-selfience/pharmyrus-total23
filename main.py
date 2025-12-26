@@ -143,7 +143,7 @@ async def get_pubchem_data(client: httpx.AsyncClient, molecule: str) -> Dict:
     return {"dev_codes": [], "cas": None, "synonyms": []}
 
 
-def build_search_queries(molecule: str, brand: str, dev_codes: List[str]) -> List[str]:
+def build_search_queries(molecule: str, brand: str, dev_codes: List[str], cas: str = None) -> List[str]:
     """Constrói queries otimizadas para busca EPO"""
     queries = []
     
@@ -156,12 +156,16 @@ def build_search_queries(molecule: str, brand: str, dev_codes: List[str]) -> Lis
         queries.append(f'txt="{brand}"')
     
     # Dev codes
-    for code in dev_codes[:3]:
+    for code in dev_codes[:5]:
         queries.append(f'txt="{code}"')
         # Sem hífen
         code_no_hyphen = code.replace("-", "")
         if code_no_hyphen != code:
             queries.append(f'txt="{code_no_hyphen}"')
+    
+    # CAS number - importante para patentes antigas
+    if cas:
+        queries.append(f'txt="{cas}"')
     
     # Applicants conhecidos + keywords
     applicants = ["Orion", "Bayer", "AstraZeneca", "Pfizer", "Novartis", "Roche", "Merck"]
@@ -171,7 +175,59 @@ def build_search_queries(molecule: str, brand: str, dev_codes: List[str]) -> Lis
         for kw in keywords[:3]:
             queries.append(f'pa="{app}" and ti="{kw}"')
     
+    # Busca por citações de WOs conhecidas (para encontrar família)
+    # Se encontramos WOs, buscar patentes que citam elas
+    queries.append(f'pa="Orion" and ti="modulating"')
+    queries.append(f'pa="Bayer" and ti="prostate"')
+    
     return queries
+
+
+async def search_related_wos(client: httpx.AsyncClient, token: str, found_wos: List[str]) -> List[str]:
+    """Busca WOs que citam os WOs já encontrados (para encontrar patentes base)"""
+    additional_wos = set()
+    
+    # Pegar primeiros 5 WOs encontrados e buscar por citações
+    for wo in found_wos[:5]:
+        try:
+            # Buscar família do WO para pegar patentes relacionadas
+            response = await client.get(
+                f"https://ops.epo.org/3.2/rest-services/family/publication/docdb/{wo}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                family = data.get("ops:world-patent-data", {}).get("ops:patent-family", {})
+                
+                # Extrair prioridade mais antiga
+                members = family.get("ops:family-member", [])
+                if not isinstance(members, list):
+                    members = [members]
+                
+                for m in members:
+                    # Buscar priority-claim para encontrar patentes base
+                    prio = m.get("priority-claim", [])
+                    if not isinstance(prio, list):
+                        prio = [prio] if prio else []
+                    
+                    for p in prio:
+                        doc_id = p.get("document-id", {})
+                        if isinstance(doc_id, list):
+                            doc_id = doc_id[0] if doc_id else {}
+                        country = doc_id.get("country", {}).get("$", "")
+                        number = doc_id.get("doc-number", {}).get("$", "")
+                        if country == "WO" and number:
+                            wo_num = f"WO{number}"
+                            if wo_num not in found_wos:
+                                additional_wos.add(wo_num)
+            
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"Error searching related WOs for {wo}: {e}")
+    
+    return list(additional_wos)
 
 
 async def search_epo(client: httpx.AsyncClient, token: str, query: str) -> List[str]:
@@ -431,7 +487,7 @@ async def search_patents(request: SearchRequest):
         logger.info(f"PubChem: {len(pubchem['dev_codes'])} dev codes, CAS: {pubchem['cas']}")
         
         # 3. Construir e executar queries
-        queries = build_search_queries(molecule, brand, pubchem["dev_codes"])
+        queries = build_search_queries(molecule, brand, pubchem["dev_codes"], pubchem["cas"])
         
         all_wos = set()
         for query in queries:
@@ -439,7 +495,16 @@ async def search_patents(request: SearchRequest):
             all_wos.update(wos)
             await asyncio.sleep(0.2)  # Rate limiting
         
-        logger.info(f"Found {len(all_wos)} unique WO patents")
+        logger.info(f"Found {len(all_wos)} unique WO patents from searches")
+        
+        # 3.5 Buscar WOs relacionados via prioridades (para encontrar patentes base)
+        if all_wos:
+            related_wos = await search_related_wos(client, token, list(all_wos)[:10])
+            if related_wos:
+                logger.info(f"Found {len(related_wos)} additional WOs from priority links")
+                all_wos.update(related_wos)
+        
+        logger.info(f"Total: {len(all_wos)} unique WO patents")
         
         # 4. Extrair patentes dos países alvo de cada WO
         patents_by_country = {cc: [] for cc in target_countries}
