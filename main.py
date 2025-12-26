@@ -1,16 +1,15 @@
 """
-Pharmyrus V19 - Complete Patent Search System
-Objetivo: Igualar ou superar Cortellis na busca de patentes BR
+Pharmyrus V20 - Complete Patent Search
+SEM SerpAPI - Usa EPO OPS + Crawlers Stealth + INPI
 
-Fluxo:
-1. PubChem → dev codes, CAS, sinônimos
-2. Google Patents Search → encontrar WOs
-3. Para cada WO → extrair BRs via worldwide_applications
-4. INPI direto → busca por nome PT/EN e dev codes
+Estratégia:
+1. PubChem → dev codes, CAS, sinônimos (API pública)
+2. EPO OPS API → busca por nome/dev codes → encontra famílias de patentes
+3. Google Patents Scraping → extrai WOs e BRs
+4. INPI crawler → busca direta múltiplos termos
 5. Deduplicação e classificação
 """
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any, List, Set
 import asyncio
@@ -18,16 +17,17 @@ import httpx
 import os
 import logging
 import re
-from datetime import datetime
-from dataclasses import dataclass, field, asdict
+import base64
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Pharmyrus V19 - Complete Patent Search",
-    description="Sistema completo de busca de patentes BR - Objetivo: superar Cortellis",
-    version="19.0.0"
+    title="Pharmyrus V20 - EPO + Stealth Crawlers",
+    description="Sistema completo usando EPO OPS + Crawlers Stealth + INPI",
+    version="20.0.0"
 )
 
 app.add_middleware(
@@ -39,56 +39,57 @@ app.add_middleware(
 )
 
 # ============================================================
-# API KEYS POOL
+# EPO OPS API CREDENTIALS
 # ============================================================
-API_KEYS = [
-    "bc20bca64032a7ac59abf330bbdeca80aa79cd72bb208059056b10fb6e33e4bc",
-    "3f22448f4d43ce8259fa2f7f6385222323a67c4ce4e72fcc774b43d23812889d",
-    "69a4de2daad0e74c7d12c81d2c22d9715b7483e4f24cfc38c9aca4e65ef8dc8a",
-    "ae35c24af9c0e26a578534082299e39f49d9a7f54ed987bb4be1dc369b41e16c",
-    "e3e629ecd3f9f8bf9cda26db2cd0e5d330c5169ca91c68d37cb3a7c66e42e3e8",
-    "19e60235f3cf6e5ac2daf95c16ca15e7a7d79a42e28828a930e11a09df967ea8",
-    "a07ed78001b5dc00ffd21a39a73e98dbc13f8e57ce5a8e45cf34878f81c37ecf",
-    "30d4e6f5bcc0fac460c704fb505ca4e8dd65c09b88b8dc5c06dcc7be8a8eb4c2",
-]
+EPO_KEY = "G5wJypxeg0GXEJoMGP37tdK370aKxeMszGKAkD6QaR0yiR5X"
+EPO_SECRET = "zg5AJ0EDzXdJey3GaFNM8ztMVxHKXRrAihXH93iS5ZAzKPAPMFLuVUfiEuAqpdbz"
 
-key_index = 0
-def get_api_key() -> str:
-    global key_index
-    key = API_KEYS[key_index % len(API_KEYS)]
-    key_index += 1
-    return key
+# Token cache
+_epo_token = None
+_epo_token_expires = None
 
 # ============================================================
-# DATA CLASSES
+# EPO TOKEN MANAGEMENT
 # ============================================================
-@dataclass
-class BRPatent:
-    number: str
-    wo_primary: str = ""
-    title: str = ""
-    patent_type: str = ""
-    holder: str = ""
-    filing_date: str = ""
-    expiry_date: str = ""
-    source: str = ""
+async def get_epo_token(client: httpx.AsyncClient) -> Optional[str]:
+    """Obtém token de acesso da EPO OPS API"""
+    global _epo_token, _epo_token_expires
     
-    def to_dict(self):
-        return asdict(self)
-
-@dataclass 
-class SearchResult:
-    molecule: str
-    timestamp: str
-    pubchem_data: Dict = field(default_factory=dict)
-    wo_numbers: List[str] = field(default_factory=list)
-    br_patents: List[Dict] = field(default_factory=list)
-    sources_used: List[str] = field(default_factory=list)
-    search_stats: Dict = field(default_factory=dict)
-    cortellis_comparison: Dict = field(default_factory=dict)
+    now = datetime.now()
+    if _epo_token and _epo_token_expires and now < _epo_token_expires:
+        return _epo_token
+    
+    try:
+        creds = f"{EPO_KEY}:{EPO_SECRET}"
+        b64_creds = base64.b64encode(creds.encode()).decode()
+        
+        response = await client.post(
+            "https://ops.epo.org/3.2/auth/accesstoken",
+            headers={
+                "Authorization": f"Basic {b64_creds}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            data={"grant_type": "client_credentials"},
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            _epo_token = data.get("access_token")
+            expires_in = int(data.get("expires_in", 1200))
+            _epo_token_expires = now + timedelta(seconds=expires_in - 60)
+            logger.info("EPO token obtained successfully")
+            return _epo_token
+        else:
+            logger.error(f"EPO token error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"EPO token exception: {e}")
+        return None
 
 # ============================================================
-# STEP 1: PUBCHEM - Obter dev codes, CAS, sinônimos
+# STEP 1: PUBCHEM
 # ============================================================
 async def get_pubchem_data(molecule: str, client: httpx.AsyncClient) -> Dict:
     """Busca dados do PubChem: dev codes, CAS, sinônimos"""
@@ -96,31 +97,32 @@ async def get_pubchem_data(molecule: str, client: httpx.AsyncClient) -> Dict:
         "dev_codes": [],
         "cas": None,
         "synonyms": [],
-        "iupac": None
+        "cid": None
     }
     
     try:
-        # Buscar sinônimos
         url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{molecule}/synonyms/JSON"
         response = await client.get(url, timeout=30.0)
         
         if response.status_code == 200:
             data = response.json()
-            synonyms = data.get("InformationList", {}).get("Information", [{}])[0].get("Synonym", [])
+            info = data.get("InformationList", {}).get("Information", [{}])[0]
+            result["cid"] = info.get("CID")
+            synonyms = info.get("Synonym", [])
             
-            # Padrões
             dev_pattern = re.compile(r'^[A-Z]{2,5}[-\s]?\d{3,7}[A-Z]?$', re.IGNORECASE)
             cas_pattern = re.compile(r'^\d{2,7}-\d{2}-\d$')
             
-            for syn in synonyms[:100]:  # Limitar a 100
+            for syn in synonyms[:100]:
                 if cas_pattern.match(syn) and not result["cas"]:
                     result["cas"] = syn
                 elif dev_pattern.match(syn) and len(result["dev_codes"]) < 15:
-                    result["dev_codes"].append(syn)
-                elif len(result["synonyms"]) < 20:
+                    if syn not in result["dev_codes"]:
+                        result["dev_codes"].append(syn)
+                elif len(result["synonyms"]) < 30 and len(syn) > 3:
                     result["synonyms"].append(syn)
             
-            logger.info(f"PubChem: {len(result['dev_codes'])} dev codes, CAS={result['cas']}")
+            logger.info(f"PubChem: CID={result['cid']}, {len(result['dev_codes'])} dev codes, CAS={result['cas']}")
     
     except Exception as e:
         logger.error(f"PubChem error: {e}")
@@ -128,157 +130,217 @@ async def get_pubchem_data(molecule: str, client: httpx.AsyncClient) -> Dict:
     return result
 
 # ============================================================
-# STEP 2: BUSCAR WO NUMBERS - Múltiplas estratégias
+# STEP 2: EPO OPS API - Buscar patentes por nome/dev codes
 # ============================================================
-async def search_wo_numbers(molecule: str, dev_codes: List[str], client: httpx.AsyncClient) -> List[str]:
-    """Busca WO numbers usando múltiplas queries"""
-    wo_numbers: Set[str] = set()
-    wo_pattern = re.compile(r'WO[-\s]?(\d{4})[-/\s]?(\d{5,6})', re.IGNORECASE)
+async def search_epo(query: str, token: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Busca patentes na EPO OPS API"""
+    patents = []
     
-    # Queries para buscar WOs
-    queries = [
-        f"{molecule} patent WO",
-        f"{molecule} pharmaceutical patent",
-        f'"{molecule}" WO patent',
-    ]
-    
-    # Adicionar queries com dev codes
-    for dev in dev_codes[:3]:
-        queries.append(f"{dev} patent WO")
-    
-    # Adicionar queries por ano
-    for year in ["2011", "2016", "2018", "2019", "2020", "2021", "2022", "2023"]:
-        queries.append(f"{molecule} patent WO{year}")
-    
-    for query in queries:
-        try:
-            api_key = get_api_key()
-            response = await client.get(
-                "https://serpapi.com/search.json",
-                params={
-                    "engine": "google",
-                    "q": query,
-                    "api_key": api_key,
-                    "num": 10
-                },
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                for result in data.get("organic_results", []):
-                    text = f"{result.get('title', '')} {result.get('snippet', '')} {result.get('link', '')}"
-                    matches = wo_pattern.findall(text)
-                    for match in matches:
-                        wo = f"WO{match[0]}{match[1]}"
-                        wo_numbers.add(wo)
-            
-            await asyncio.sleep(0.3)  # Rate limiting
-            
-        except Exception as e:
-            logger.error(f"WO search error for '{query}': {e}")
-    
-    # Busca também no Google Patents diretamente
     try:
-        api_key = get_api_key()
+        # EPO search endpoint
+        url = f"https://ops.epo.org/3.2/rest-services/published-data/search"
+        
         response = await client.get(
-            "https://serpapi.com/search.json",
-            params={
-                "engine": "google_patents",
-                "q": molecule,
-                "api_key": api_key,
-                "num": 20
+            url,
+            params={"q": query, "Range": "1-100"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
             },
             timeout=30.0
         )
         
         if response.status_code == 200:
             data = response.json()
-            for result in data.get("organic_results", []):
-                patent_id = result.get("patent_id", "")
-                if patent_id.startswith("WO"):
-                    wo_numbers.add(patent_id.replace("-", ""))
-                    
+            
+            # Parse EPO response
+            search_result = data.get("ops:world-patent-data", {}).get("ops:biblio-search", {})
+            total = search_result.get("@total-result-count", 0)
+            logger.info(f"EPO search '{query[:30]}...': {total} results")
+            
+            pub_refs = search_result.get("ops:search-result", {}).get("ops:publication-reference", [])
+            if not isinstance(pub_refs, list):
+                pub_refs = [pub_refs] if pub_refs else []
+            
+            for ref in pub_refs[:50]:
+                doc_id = ref.get("document-id", {})
+                if isinstance(doc_id, list):
+                    doc_id = doc_id[0] if doc_id else {}
+                
+                country = doc_id.get("country", {}).get("$", "")
+                doc_number = doc_id.get("doc-number", {}).get("$", "")
+                kind = doc_id.get("kind", {}).get("$", "")
+                
+                if country and doc_number:
+                    patents.append({
+                        "country": country,
+                        "number": f"{country}{doc_number}",
+                        "kind": kind,
+                        "full_number": f"{country}-{doc_number}-{kind}" if kind else f"{country}-{doc_number}"
+                    })
+        
+        elif response.status_code == 404:
+            logger.info(f"EPO search '{query[:30]}...': no results")
+        else:
+            logger.warning(f"EPO search error: {response.status_code}")
+            
     except Exception as e:
-        logger.error(f"Google Patents search error: {e}")
+        logger.error(f"EPO search exception: {e}")
     
-    logger.info(f"Found {len(wo_numbers)} unique WO numbers")
-    return list(wo_numbers)
+    return patents
 
-# ============================================================
-# STEP 3: EXTRAIR BRs DE CADA WO
-# ============================================================
-async def extract_br_from_wo(wo_number: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Extrai patentes BR de um WO number via Google Patents"""
-    br_patents = []
+async def get_epo_family(patent_number: str, token: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Busca família de patentes (incluindo BR) para um patent number"""
+    family_members = []
     
     try:
-        api_key = get_api_key()
+        # Clean patent number
+        clean_num = re.sub(r'[^A-Z0-9]', '', patent_number.upper())
         
-        # Primeiro, buscar o patent
+        # Family endpoint
+        url = f"https://ops.epo.org/3.2/rest-services/family/publication/docdb/{clean_num}/biblio"
+        
         response = await client.get(
-            "https://serpapi.com/search.json",
-            params={
-                "engine": "google_patents",
-                "q": wo_number,
-                "api_key": api_key
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
             },
             timeout=30.0
         )
         
-        if response.status_code != 200:
-            return br_patents
-        
-        data = response.json()
-        results = data.get("organic_results", [])
-        
-        if not results:
-            return br_patents
-        
-        # Pegar o serpapi_link do primeiro resultado
-        serpapi_link = results[0].get("serpapi_link")
-        if not serpapi_link:
-            return br_patents
-        
-        # Buscar detalhes
-        await asyncio.sleep(0.3)
-        detail_response = await client.get(
-            f"{serpapi_link}&api_key={api_key}",
-            timeout=30.0
-        )
-        
-        if detail_response.status_code != 200:
-            return br_patents
-        
-        detail_data = detail_response.json()
-        
-        # Extrair worldwide_applications
-        worldwide = detail_data.get("worldwide_applications", {})
-        
-        for year, apps in worldwide.items():
-            if isinstance(apps, list):
-                for app in apps:
-                    # Verificar country_code OU document_id começando com BR
-                    country = app.get("country_code", "")
-                    doc_id = app.get("document_id", "")
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Parse family members
+            patent_family = data.get("ops:world-patent-data", {}).get("ops:patent-family", {})
+            family_members_raw = patent_family.get("ops:family-member", [])
+            
+            if not isinstance(family_members_raw, list):
+                family_members_raw = [family_members_raw] if family_members_raw else []
+            
+            for member in family_members_raw:
+                pub_ref = member.get("publication-reference", {})
+                doc_id = pub_ref.get("document-id", {})
+                
+                if isinstance(doc_id, list):
+                    doc_id = doc_id[0] if doc_id else {}
+                
+                country = doc_id.get("country", {}).get("$", "")
+                doc_number = doc_id.get("doc-number", {}).get("$", "")
+                kind = doc_id.get("kind", {}).get("$", "")
+                
+                if country and doc_number:
+                    family_members.append({
+                        "country": country,
+                        "number": f"{country}{doc_number}",
+                        "kind": kind,
+                        "full_number": f"{country}-{doc_number}"
+                    })
                     
-                    if country == "BR" or doc_id.startswith("BR"):
-                        br_patents.append({
-                            "number": doc_id,
-                            "wo_primary": wo_number,
-                            "title": app.get("title", ""),
-                            "filing_date": app.get("filing_date", ""),
-                            "source": "google_patents_worldwide"
-                        })
-                        logger.info(f"  Found BR: {doc_id} from {wo_number}")
-        
     except Exception as e:
-        logger.error(f"Error extracting BR from {wo_number}: {e}")
+        logger.error(f"EPO family error for {patent_number}: {e}")
     
-    return br_patents
+    return family_members
 
 # ============================================================
-# STEP 4: BUSCA INPI DIRETA
+# STEP 3: GOOGLE PATENTS SCRAPING (Stealth)
+# ============================================================
+async def scrape_google_patents(query: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Scraping stealth do Google Patents"""
+    patents = []
+    
+    try:
+        # Headers stealth
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        
+        # URL do Google Patents
+        url = f"https://patents.google.com/?q={query}&oq={query}"
+        
+        response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+        
+        if response.status_code == 200:
+            html = response.text
+            
+            # Extrair patent IDs do HTML
+            # Padrão: /patent/WO2016162604 ou /patent/BR112017021636
+            patent_pattern = re.compile(r'/patent/([A-Z]{2}\d+[A-Z]?\d*)', re.IGNORECASE)
+            matches = patent_pattern.findall(html)
+            
+            seen = set()
+            for match in matches:
+                if match not in seen:
+                    seen.add(match)
+                    country = match[:2]
+                    patents.append({
+                        "country": country,
+                        "number": match,
+                        "source": "google_patents_scrape"
+                    })
+            
+            logger.info(f"Google Patents scrape '{query[:20]}...': {len(patents)} patents")
+            
+    except Exception as e:
+        logger.error(f"Google Patents scrape error: {e}")
+    
+    return patents
+
+async def get_google_patent_family(patent_id: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Busca família de patentes no Google Patents"""
+    family = []
+    
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        
+        url = f"https://patents.google.com/patent/{patent_id}"
+        response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+        
+        if response.status_code == 200:
+            html = response.text
+            
+            # Procurar seção "Also published as" ou "Patent family"
+            # Padrão BR no HTML
+            br_pattern = re.compile(r'BR[-\s]?(\d{9,15}|\d{6,8})', re.IGNORECASE)
+            matches = br_pattern.findall(html)
+            
+            for match in matches:
+                br_num = f"BR{match}".replace(" ", "").replace("-", "")
+                family.append({
+                    "country": "BR",
+                    "number": br_num,
+                    "source": "google_patents_family"
+                })
+            
+            # Também procurar padrões mais específicos
+            br_full_pattern = re.compile(r'BR[-\s]?1[12][-\s]?\d{4}[-\s]?\d{6}[-\s]?\d', re.IGNORECASE)
+            full_matches = br_full_pattern.findall(html)
+            
+            for match in full_matches:
+                clean = re.sub(r'[^A-Z0-9]', '', match.upper())
+                if clean not in [f["number"] for f in family]:
+                    family.append({
+                        "country": "BR",
+                        "number": clean,
+                        "source": "google_patents_family"
+                    })
+                    
+    except Exception as e:
+        logger.error(f"Google Patents family error: {e}")
+    
+    return family
+
+# ============================================================
+# STEP 4: INPI CRAWLER
 # ============================================================
 async def search_inpi(terms: List[str], client: httpx.AsyncClient) -> List[Dict]:
     """Busca direta no INPI usando múltiplos termos"""
@@ -286,7 +348,7 @@ async def search_inpi(terms: List[str], client: httpx.AsyncClient) -> List[Dict]
     seen_numbers = set()
     
     for term in terms:
-        if not term:
+        if not term or len(term) < 3:
             continue
             
         try:
@@ -302,66 +364,124 @@ async def search_inpi(terms: List[str], client: httpx.AsyncClient) -> List[Dict]
                     title = patent.get("title", "")
                     if title.startswith("BR") and title not in seen_numbers:
                         seen_numbers.add(title)
+                        
+                        # Normalizar número
+                        clean_num = re.sub(r'\s+', '-', title)
+                        
                         br_patents.append({
-                            "number": title.replace(" ", "-"),
-                            "wo_primary": "",
+                            "number": clean_num,
                             "title": patent.get("applicant", ""),
                             "filing_date": patent.get("depositDate", ""),
                             "holder": patent.get("applicant", ""),
+                            "full_text": patent.get("fullText", ""),
                             "source": "inpi_direct"
                         })
-                        logger.info(f"  INPI found: {title} for term '{term}'")
+                        logger.info(f"INPI found: {clean_num} for '{term}'")
             
-            await asyncio.sleep(0.5)  # Rate limiting INPI
+            await asyncio.sleep(1.0)  # Rate limiting INPI
             
         except Exception as e:
-            logger.error(f"INPI search error for '{term}': {e}")
+            logger.error(f"INPI error for '{term}': {e}")
     
     return br_patents
 
 # ============================================================
-# STEP 5: DEDUPLICAÇÃO E CLASSIFICAÇÃO
+# STEP 5: ESPACENET SCRAPING
 # ============================================================
+async def search_espacenet(query: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Busca no Espacenet (fallback)"""
+    patents = []
+    
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+        
+        # Espacenet API endpoint
+        url = "https://worldwide.espacenet.com/3.2/rest-services/search"
+        
+        response = await client.get(
+            url,
+            params={"q": query, "ql": "cql"},
+            headers=headers,
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            # Parse response
+            data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            logger.info(f"Espacenet search: {len(data)} results")
+            
+    except Exception as e:
+        logger.error(f"Espacenet error: {e}")
+    
+    return patents
+
+# ============================================================
+# DEDUPLICATION & CLASSIFICATION
+# ============================================================
+def normalize_br_number(number: str) -> str:
+    """Normaliza número de patente BR"""
+    # Remove espaços e caracteres especiais
+    clean = re.sub(r'[^A-Z0-9]', '', number.upper())
+    
+    # Formatar como BR-XXXXXXXXXX-X
+    if clean.startswith("BR") and len(clean) > 2:
+        rest = clean[2:]
+        # Tentar formatar como BR 11 2024 016586 8
+        if len(rest) >= 13:
+            return f"BR-{rest[:2]}-{rest[2:6]}-{rest[6:12]}-{rest[12:]}"
+        elif len(rest) >= 7:
+            return f"BR-{rest}"
+    
+    return number
+
 def deduplicate_patents(patents: List[Dict]) -> List[Dict]:
-    """Remove duplicatas baseado no número da patente"""
+    """Remove duplicatas"""
     seen = {}
     
     for p in patents:
-        # Normalizar número
-        num = p.get("number", "").upper().replace(" ", "-").replace("/", "-")
-        num = re.sub(r'[^A-Z0-9-]', '', num)
+        num = p.get("number", "").upper()
+        num_clean = re.sub(r'[^A-Z0-9]', '', num)
         
-        if not num:
+        if not num_clean or len(num_clean) < 5:
             continue
         
-        # Manter o mais completo
-        if num not in seen:
-            seen[num] = p
+        if num_clean not in seen:
+            seen[num_clean] = p.copy()
+            seen[num_clean]["number_normalized"] = normalize_br_number(num)
         else:
             # Merge info
-            existing = seen[num]
-            for key in ["wo_primary", "title", "holder", "filing_date"]:
-                if not existing.get(key) and p.get(key):
-                    existing[key] = p[key]
+            for key in ["title", "holder", "filing_date", "wo_primary"]:
+                if not seen[num_clean].get(key) and p.get(key):
+                    seen[num_clean][key] = p[key]
+            # Add sources
+            existing_source = seen[num_clean].get("source", "")
+            new_source = p.get("source", "")
+            if new_source and new_source not in existing_source:
+                seen[num_clean]["source"] = f"{existing_source},{new_source}" if existing_source else new_source
     
     return list(seen.values())
 
 def classify_patent(patent: Dict) -> str:
-    """Classifica o tipo de patente baseado no título"""
-    title = (patent.get("title", "") or "").lower()
+    """Classifica tipo de patente"""
+    text = (patent.get("title", "") + " " + patent.get("full_text", "")).lower()
     
-    if any(w in title for w in ["cristalina", "crystalline", "polymorph"]):
+    if any(w in text for w in ["cristalina", "crystalline", "polymorph", "crystal form"]):
         return "CRYSTALLINE"
-    elif any(w in title for w in ["processo", "process", "synthesis", "preparation"]):
+    elif any(w in text for w in ["processo", "process", "synthesis", "preparation", "method of making"]):
         return "PROCESS"
-    elif any(w in title for w in ["formulação", "formulation", "composition"]):
+    elif any(w in text for w in ["formulação", "formulation", "composition", "dosage"]):
         return "FORMULATION"
-    elif any(w in title for w in ["uso", "use", "treatment", "method"]):
+    elif any(w in text for w in ["uso", "use", "treatment", "method of treatment", "therapy"]):
         return "MEDICAL_USE"
-    elif any(w in title for w in ["sal", "salt"]):
+    elif any(w in text for w in ["sal ", "salt", "salts"]):
         return "SALT"
-    elif any(w in title for w in ["combinação", "combination"]):
+    elif any(w in text for w in ["combinação", "combination"]):
         return "COMBINATION"
+    elif any(w in text for w in ["intermediário", "intermediate"]):
+        return "INTERMEDIATE"
     else:
         return "OTHER"
 
@@ -370,97 +490,172 @@ def classify_patent(patent: Dict) -> str:
 # ============================================================
 @app.get("/api/v1/search/complete")
 async def complete_search(
-    molecule_name: str = Query(..., description="Nome da molécula"),
+    molecule_name: str = Query(..., description="Nome da molécula (inglês)"),
     molecule_name_pt: Optional[str] = Query(None, description="Nome em português"),
-    expected_br_count: int = Query(8, description="Número esperado de BRs (Cortellis)")
+    expected_br_count: int = Query(8, description="Número esperado de BRs (Cortellis benchmark)")
 ):
     """
-    Busca COMPLETA de patentes BR - objetivo: igualar/superar Cortellis
+    Busca COMPLETA de patentes BR
     
-    Estratégia:
-    1. PubChem → dev codes, CAS, sinônimos
-    2. Google + Google Patents → encontrar WOs
-    3. Para cada WO → extrair BRs via worldwide_applications  
-    4. INPI direto → busca por nome PT/EN e dev codes
-    5. Deduplicação e classificação
+    Estratégia multi-fonte:
+    1. PubChem → dev codes, CAS
+    2. EPO OPS → busca + famílias de patentes
+    3. Google Patents Scraping → WOs e BRs
+    4. INPI Crawler → busca direta
     """
     start_time = datetime.now()
+    all_br_patents = []
+    all_wo_numbers = set()
+    sources_used = []
     
     async with httpx.AsyncClient() as client:
-        # STEP 1: PubChem
+        # ========== STEP 1: PUBCHEM ==========
         logger.info(f"=== STEP 1: PubChem for {molecule_name} ===")
         pubchem_data = await get_pubchem_data(molecule_name, client)
+        sources_used.append("pubchem")
         
-        # STEP 2: Buscar WO numbers
-        logger.info(f"=== STEP 2: Searching WO numbers ===")
-        wo_numbers = await search_wo_numbers(
-            molecule_name, 
-            pubchem_data["dev_codes"], 
-            client
-        )
+        # ========== STEP 2: EPO OPS ==========
+        logger.info(f"=== STEP 2: EPO OPS API ===")
+        epo_token = await get_epo_token(client)
         
-        # STEP 3: Extrair BRs de cada WO
-        logger.info(f"=== STEP 3: Extracting BR patents from {len(wo_numbers)} WOs ===")
-        all_br_patents = []
+        if epo_token:
+            sources_used.append("epo_ops")
+            
+            # Buscar por nome da molécula
+            search_terms = [molecule_name]
+            if molecule_name_pt:
+                search_terms.append(molecule_name_pt)
+            search_terms.extend(pubchem_data["dev_codes"][:5])
+            
+            epo_patents = []
+            for term in search_terms[:8]:
+                results = await search_epo(f'txt="{term}"', epo_token, client)
+                epo_patents.extend(results)
+                await asyncio.sleep(0.5)
+            
+            # Separar WOs e BRs
+            for p in epo_patents:
+                if p["country"] == "WO":
+                    all_wo_numbers.add(p["number"])
+                elif p["country"] == "BR":
+                    all_br_patents.append({
+                        "number": p["full_number"],
+                        "source": "epo_search"
+                    })
+            
+            logger.info(f"EPO found: {len(all_wo_numbers)} WOs, {len([p for p in epo_patents if p['country']=='BR'])} BRs")
+            
+            # Buscar famílias dos WOs encontrados
+            for wo in list(all_wo_numbers)[:15]:
+                family = await get_epo_family(wo, epo_token, client)
+                for member in family:
+                    if member["country"] == "BR":
+                        all_br_patents.append({
+                            "number": member["full_number"],
+                            "wo_primary": wo,
+                            "source": "epo_family"
+                        })
+                await asyncio.sleep(0.3)
         
-        for wo in wo_numbers[:20]:  # Limitar a 20 WOs
-            br_patents = await extract_br_from_wo(wo, client)
-            all_br_patents.extend(br_patents)
-            await asyncio.sleep(0.3)
+        # ========== STEP 3: GOOGLE PATENTS SCRAPING ==========
+        logger.info(f"=== STEP 3: Google Patents Scraping ===")
+        sources_used.append("google_patents")
         
-        # STEP 4: INPI Direto
-        logger.info(f"=== STEP 4: Direct INPI search ===")
+        gp_queries = [molecule_name]
+        if pubchem_data["dev_codes"]:
+            gp_queries.append(pubchem_data["dev_codes"][0])
+        
+        for query in gp_queries[:3]:
+            gp_results = await scrape_google_patents(query, client)
+            
+            for p in gp_results:
+                if p["country"] == "WO":
+                    all_wo_numbers.add(p["number"])
+                elif p["country"] == "BR":
+                    all_br_patents.append({
+                        "number": p["number"],
+                        "source": "google_patents"
+                    })
+            
+            await asyncio.sleep(1.0)
+        
+        # Buscar famílias dos WOs no Google Patents
+        for wo in list(all_wo_numbers)[:10]:
+            family = await get_google_patent_family(wo, client)
+            for member in family:
+                all_br_patents.append({
+                    "number": member["number"],
+                    "wo_primary": wo,
+                    "source": member.get("source", "google_patents_family")
+                })
+            await asyncio.sleep(0.5)
+        
+        # ========== STEP 4: INPI CRAWLER ==========
+        logger.info(f"=== STEP 4: INPI Crawler ===")
+        sources_used.append("inpi")
+        
         inpi_terms = [molecule_name]
         if molecule_name_pt:
             inpi_terms.append(molecule_name_pt)
-        inpi_terms.extend(pubchem_data["dev_codes"][:5])
+        inpi_terms.extend(pubchem_data["dev_codes"][:7])
+        
+        # Adicionar sinônimos relevantes
+        for syn in pubchem_data["synonyms"][:5]:
+            if len(syn) > 5 and not any(c.isdigit() for c in syn[:3]):
+                inpi_terms.append(syn)
         
         inpi_patents = await search_inpi(inpi_terms, client)
         all_br_patents.extend(inpi_patents)
         
-        # STEP 5: Deduplicação
+        # ========== STEP 5: DEDUPLICATION ==========
         logger.info(f"=== STEP 5: Deduplication ===")
+        logger.info(f"Raw BR patents: {len(all_br_patents)}")
+        
         unique_patents = deduplicate_patents(all_br_patents)
         
         # Classificar
         for p in unique_patents:
             p["patent_type"] = classify_patent(p)
         
-        # Ordenar por número
+        # Ordenar
         unique_patents.sort(key=lambda x: x.get("number", ""))
         
         elapsed = (datetime.now() - start_time).total_seconds()
         
-        # Resultado
+        # ========== RESULT ==========
         result = {
             "molecule": molecule_name,
             "molecule_pt": molecule_name_pt,
             "timestamp": datetime.now().isoformat(),
-            "elapsed_seconds": elapsed,
+            "elapsed_seconds": round(elapsed, 2),
             "pubchem_data": {
+                "cid": pubchem_data["cid"],
                 "dev_codes": pubchem_data["dev_codes"],
                 "cas": pubchem_data["cas"],
                 "synonyms_count": len(pubchem_data["synonyms"])
             },
             "search_stats": {
-                "wo_numbers_found": len(wo_numbers),
-                "wo_numbers": wo_numbers[:20],
-                "inpi_terms_searched": inpi_terms,
+                "sources_used": sources_used,
+                "wo_numbers_found": len(all_wo_numbers),
+                "wo_numbers": sorted(list(all_wo_numbers))[:20],
                 "raw_br_count": len(all_br_patents),
                 "unique_br_count": len(unique_patents)
             },
             "cortellis_comparison": {
                 "expected": expected_br_count,
                 "found": len(unique_patents),
-                "match_rate": f"{min(len(unique_patents) / max(expected_br_count, 1) * 100, 100):.1f}%",
-                "status": "✅ EXCELLENT" if len(unique_patents) >= expected_br_count else 
-                         "🟡 GOOD" if len(unique_patents) >= expected_br_count * 0.75 else
-                         "🔴 NEEDS IMPROVEMENT"
+                "match_rate": f"{min(len(unique_patents) / max(expected_br_count, 1) * 100, 150):.1f}%",
+                "status": (
+                    "✅ EXCELLENT" if len(unique_patents) >= expected_br_count else
+                    "🟡 GOOD" if len(unique_patents) >= expected_br_count * 0.75 else
+                    "🟠 PARTIAL" if len(unique_patents) >= expected_br_count * 0.5 else
+                    "🔴 NEEDS IMPROVEMENT"
+                )
             },
             "br_patents": unique_patents
         }
         
-        logger.info(f"=== COMPLETE: Found {len(unique_patents)} unique BR patents in {elapsed:.1f}s ===")
+        logger.info(f"=== COMPLETE: {len(unique_patents)} unique BR patents in {elapsed:.1f}s ===")
         
         return result
 
@@ -470,11 +665,11 @@ async def complete_search(
 @app.get("/")
 async def root():
     return {
-        "service": "Pharmyrus V19 - Complete Patent Search",
-        "version": "19.0.0",
-        "objective": "Match or exceed Cortellis BR patent coverage",
+        "service": "Pharmyrus V20",
+        "version": "20.0.0",
+        "description": "Patent search using EPO OPS + Stealth Crawlers + INPI",
         "endpoints": {
-            "complete_search": "/api/v1/search/complete?molecule_name=darolutamide&molecule_name_pt=darolutamida&expected_br_count=8",
+            "complete_search": "/api/v1/search/complete?molecule_name=darolutamide&molecule_name_pt=darolutamida",
             "health": "/health"
         }
     }
@@ -483,8 +678,8 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "19.0.0",
-        "api_keys_available": len(API_KEYS)
+        "version": "20.0.0",
+        "sources": ["pubchem", "epo_ops", "google_patents_scrape", "inpi_crawler"]
     }
 
 if __name__ == "__main__":
