@@ -1,17 +1,18 @@
 """
-Pharmyrus V20 - Complete Patent Search
-SEM SerpAPI - Usa EPO OPS + Crawlers Stealth + INPI
+Pharmyrus V22 - AUTODESCOBERTA COMPLETA
 
-Estratégia:
-1. PubChem → dev codes, CAS, sinônimos (API pública)
-2. EPO OPS API → busca por nome/dev codes → encontra famílias de patentes
-3. Google Patents Scraping → extrai WOs e BRs
-4. INPI crawler → busca direta múltiplos termos
-5. Deduplicação e classificação
+A partir APENAS do nome da molécula:
+1. Descobre dev codes, CAS, sinônimos (PubChem)
+2. Descobre nome comercial e fabricantes (DrugBank scraping)
+3. Traduz para português automaticamente
+4. Faz primeira busca EPO → descobre APPLICANTS
+5. Faz segunda busca EPO com applicants → encontra mais WOs
+6. Busca família de cada WO → extrai BRs
+7. Busca INPI com todos os termos descobertos
 """
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, Any, List, Set
+from typing import Optional, Dict, List, Set
 import asyncio
 import httpx
 import os
@@ -19,15 +20,14 @@ import logging
 import re
 import base64
 from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Pharmyrus V20 - EPO + Stealth Crawlers",
-    description="Sistema completo usando EPO OPS + Crawlers Stealth + INPI",
-    version="20.0.0"
+    title="Pharmyrus V22 - Autodescoberta",
+    version="22.0.0"
 )
 
 app.add_middleware(
@@ -38,21 +38,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# EPO OPS API CREDENTIALS
-# ============================================================
+# EPO Credentials
 EPO_KEY = "G5wJypxeg0GXEJoMGP37tdK370aKxeMszGKAkD6QaR0yiR5X"
 EPO_SECRET = "zg5AJ0EDzXdJey3GaFNM8ztMVxHKXRrAihXH93iS5ZAzKPAPMFLuVUfiEuAqpdbz"
-
-# Token cache
 _epo_token = None
 _epo_token_expires = None
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
+}
+
 # ============================================================
-# EPO TOKEN MANAGEMENT
+# TRADUÇÃO AUTOMÁTICA (MyMemory API - gratuita)
+# ============================================================
+async def translate_to_portuguese(text: str, client: httpx.AsyncClient) -> str:
+    """Traduz texto para português usando MyMemory API (gratuita)"""
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={quote_plus(text)}&langpair=en|pt-BR"
+        response = await client.get(url, timeout=10.0)
+        
+        if response.status_code == 200:
+            data = response.json()
+            translated = data.get("responseData", {}).get("translatedText", "")
+            if translated and translated.lower() != text.lower():
+                logger.info(f"Tradução: {text} → {translated}")
+                return translated
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+    
+    # Fallback: adicionar sufixo comum em português
+    if text.endswith("ide"):
+        return text[:-1] + "a"  # darolutamide → darolutamida
+    elif text.endswith("ib"):
+        return text + "e"  # olaparib → olaparibe
+    return text
+
+# ============================================================
+# EPO TOKEN
 # ============================================================
 async def get_epo_token(client: httpx.AsyncClient) -> Optional[str]:
-    """Obtém token de acesso da EPO OPS API"""
     global _epo_token, _epo_token_expires
     
     now = datetime.now()
@@ -61,14 +87,11 @@ async def get_epo_token(client: httpx.AsyncClient) -> Optional[str]:
     
     try:
         creds = f"{EPO_KEY}:{EPO_SECRET}"
-        b64_creds = base64.b64encode(creds.encode()).decode()
+        b64 = base64.b64encode(creds.encode()).decode()
         
         response = await client.post(
             "https://ops.epo.org/3.2/auth/accesstoken",
-            headers={
-                "Authorization": f"Basic {b64_creds}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers={"Authorization": f"Basic {b64}", "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "client_credentials"},
             timeout=30.0
         )
@@ -76,29 +99,17 @@ async def get_epo_token(client: httpx.AsyncClient) -> Optional[str]:
         if response.status_code == 200:
             data = response.json()
             _epo_token = data.get("access_token")
-            expires_in = int(data.get("expires_in", 1200))
-            _epo_token_expires = now + timedelta(seconds=expires_in - 60)
-            logger.info("EPO token obtained successfully")
+            _epo_token_expires = now + timedelta(seconds=int(data.get("expires_in", 1200)) - 60)
             return _epo_token
-        else:
-            logger.error(f"EPO token error: {response.status_code}")
-            return None
-            
     except Exception as e:
-        logger.error(f"EPO token exception: {e}")
-        return None
+        logger.error(f"EPO token error: {e}")
+    return None
 
 # ============================================================
-# STEP 1: PUBCHEM
+# FASE 1: PUBCHEM - dev codes, CAS, sinônimos
 # ============================================================
-async def get_pubchem_data(molecule: str, client: httpx.AsyncClient) -> Dict:
-    """Busca dados do PubChem: dev codes, CAS, sinônimos"""
-    result = {
-        "dev_codes": [],
-        "cas": None,
-        "synonyms": [],
-        "cid": None
-    }
+async def enrich_from_pubchem(molecule: str, client: httpx.AsyncClient) -> Dict:
+    result = {"dev_codes": [], "cas": None, "synonyms": [], "cid": None, "brand_names": []}
     
     try:
         url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{molecule}/synonyms/JSON"
@@ -113,113 +124,204 @@ async def get_pubchem_data(molecule: str, client: httpx.AsyncClient) -> Dict:
             dev_pattern = re.compile(r'^[A-Z]{2,5}[-\s]?\d{3,7}[A-Z]?$', re.IGNORECASE)
             cas_pattern = re.compile(r'^\d{2,7}-\d{2}-\d$')
             
-            for syn in synonyms[:100]:
+            for syn in synonyms[:150]:
                 if cas_pattern.match(syn) and not result["cas"]:
                     result["cas"] = syn
                 elif dev_pattern.match(syn) and len(result["dev_codes"]) < 15:
                     if syn not in result["dev_codes"]:
                         result["dev_codes"].append(syn)
-                elif len(result["synonyms"]) < 30 and len(syn) > 3:
-                    result["synonyms"].append(syn)
+                elif len(syn) > 3 and len(syn) < 30:
+                    # Detectar nomes comerciais (geralmente capitalizados)
+                    if syn[0].isupper() and " " not in syn and not any(c.isdigit() for c in syn[:3]):
+                        if syn not in result["brand_names"] and len(result["brand_names"]) < 10:
+                            result["brand_names"].append(syn)
+                    elif len(result["synonyms"]) < 20:
+                        result["synonyms"].append(syn)
             
-            logger.info(f"PubChem: CID={result['cid']}, {len(result['dev_codes'])} dev codes, CAS={result['cas']}")
-    
+            logger.info(f"PubChem: CID={result['cid']}, {len(result['dev_codes'])} dev codes, {len(result['brand_names'])} brand names")
     except Exception as e:
         logger.error(f"PubChem error: {e}")
     
     return result
 
 # ============================================================
-# STEP 2: EPO OPS API - Buscar patentes por nome/dev codes
+# FASE 1B: DRUGBANK SCRAPING - fabricante, nome comercial
 # ============================================================
-async def search_epo(query: str, token: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Busca patentes na EPO OPS API"""
-    patents = []
+async def scrape_drugbank(molecule: str, client: httpx.AsyncClient) -> Dict:
+    """Scraping do DrugBank para encontrar fabricante e nome comercial"""
+    result = {"manufacturer": None, "brand_name": None, "categories": []}
     
     try:
-        # EPO search endpoint
-        url = f"https://ops.epo.org/3.2/rest-services/published-data/search"
-        
-        response = await client.get(
-            url,
-            params={"q": query, "Range": "1-100"},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            },
-            timeout=30.0
-        )
+        # Buscar página do DrugBank via Google
+        search_url = f"https://go.drugbank.com/unearth/q?query={quote_plus(molecule)}&searcher=drugs"
+        response = await client.get(search_url, headers=HEADERS, timeout=30.0, follow_redirects=True)
         
         if response.status_code == 200:
-            data = response.json()
+            html = response.text
             
-            # Parse EPO response
-            search_result = data.get("ops:world-patent-data", {}).get("ops:biblio-search", {})
-            total = search_result.get("@total-result-count", 0)
-            logger.info(f"EPO search '{query[:30]}...': {total} results")
+            # Extrair fabricante
+            mfr_pattern = re.compile(r'Manufacturer[s]?.*?<[^>]+>([^<]+)</[^>]+>', re.IGNORECASE | re.DOTALL)
+            mfr_match = mfr_pattern.search(html)
+            if mfr_match:
+                result["manufacturer"] = mfr_match.group(1).strip()
             
-            pub_refs = search_result.get("ops:search-result", {}).get("ops:publication-reference", [])
-            if not isinstance(pub_refs, list):
-                pub_refs = [pub_refs] if pub_refs else []
+            # Extrair nome comercial
+            brand_pattern = re.compile(r'Brand\s*name[s]?.*?<[^>]+>([^<]+)</[^>]+>', re.IGNORECASE | re.DOTALL)
+            brand_match = brand_pattern.search(html)
+            if brand_match:
+                result["brand_name"] = brand_match.group(1).strip()
             
-            for ref in pub_refs[:50]:
-                doc_id = ref.get("document-id", {})
-                if isinstance(doc_id, list):
-                    doc_id = doc_id[0] if doc_id else {}
-                
-                country = doc_id.get("country", {}).get("$", "")
-                doc_number = doc_id.get("doc-number", {}).get("$", "")
-                kind = doc_id.get("kind", {}).get("$", "")
-                
-                if country and doc_number:
-                    patents.append({
-                        "country": country,
-                        "number": f"{country}{doc_number}",
-                        "kind": kind,
-                        "full_number": f"{country}-{doc_number}-{kind}" if kind else f"{country}-{doc_number}"
-                    })
-        
-        elif response.status_code == 404:
-            logger.info(f"EPO search '{query[:30]}...': no results")
-        else:
-            logger.warning(f"EPO search error: {response.status_code}")
+            # Tentar extrair de "Products" section
+            prod_pattern = re.compile(r'<td[^>]*>([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)</td>\s*<td[^>]*>([^<]+)</td>', re.IGNORECASE)
+            for match in prod_pattern.finditer(html):
+                brand = match.group(1).strip()
+                company = match.group(2).strip()
+                if not result["brand_name"] and len(brand) > 3:
+                    result["brand_name"] = brand
+                if not result["manufacturer"] and len(company) > 3:
+                    result["manufacturer"] = company
             
+            logger.info(f"DrugBank: brand={result['brand_name']}, manufacturer={result['manufacturer']}")
     except Exception as e:
-        logger.error(f"EPO search exception: {e}")
+        logger.error(f"DrugBank error: {e}")
     
-    return patents
+    return result
 
-async def get_epo_family(patent_number: str, token: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Busca família de patentes (incluindo BR) para um patent number"""
-    family_members = []
+# ============================================================
+# FASE 2: EPO BUSCA INICIAL - descobrir applicants
+# ============================================================
+async def epo_search_discover_applicants(molecule: str, dev_codes: List[str], token: str, client: httpx.AsyncClient) -> tuple:
+    """Primeira busca EPO para descobrir applicants e WOs iniciais"""
+    wo_numbers = set()
+    applicants = set()
+    
+    queries = [f'txt="{molecule}"', f'ti="{molecule}"']
+    for dev in dev_codes[:3]:
+        queries.append(f'txt="{dev}"')
+    
+    for query in queries:
+        try:
+            response = await client.get(
+                "https://ops.epo.org/3.2/rest-services/published-data/search/biblio",
+                params={"q": query, "Range": "1-50"},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                search_result = data.get("ops:world-patent-data", {}).get("ops:biblio-search", {})
+                
+                pub_refs = search_result.get("ops:search-result", {}).get("exchange-documents", [])
+                if not isinstance(pub_refs, list):
+                    pub_refs = [pub_refs] if pub_refs else []
+                
+                for doc in pub_refs:
+                    # Extrair WO
+                    bib = doc.get("exchange-document", {}).get("bibliographic-data", {})
+                    pub_ref = bib.get("publication-reference", {})
+                    doc_id = pub_ref.get("document-id", {})
+                    if isinstance(doc_id, list):
+                        doc_id = doc_id[0] if doc_id else {}
+                    
+                    country = doc_id.get("country", {}).get("$", "")
+                    number = doc_id.get("doc-number", {}).get("$", "")
+                    
+                    if country == "WO" and number:
+                        wo_numbers.add(f"WO{number}")
+                    
+                    # Extrair applicants
+                    parties = bib.get("parties", {})
+                    apps = parties.get("applicants", {}).get("applicant", [])
+                    if not isinstance(apps, list):
+                        apps = [apps] if apps else []
+                    
+                    for app in apps:
+                        name = app.get("applicant-name", {}).get("name", {}).get("$", "")
+                        if name:
+                            # Limpar nome
+                            clean = re.sub(r'\s*(Inc|Corp|Ltd|LLC|GmbH|AG|S\.?A\.?|Co\.?)\.?\s*$', '', name, flags=re.IGNORECASE).strip()
+                            if len(clean) > 2:
+                                applicants.add(clean)
+            
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"EPO discover error: {e}")
+    
+    logger.info(f"EPO Discover: {len(wo_numbers)} WOs, {len(applicants)} applicants: {list(applicants)[:5]}")
+    return wo_numbers, applicants
+
+# ============================================================
+# FASE 3: EPO BUSCA EXPANDIDA - com applicants descobertos
+# ============================================================
+async def epo_search_with_applicants(molecule: str, applicants: Set[str], token: str, client: httpx.AsyncClient) -> Set[str]:
+    """Segunda busca EPO usando applicants descobertos"""
+    wo_numbers = set()
+    
+    for applicant in list(applicants)[:10]:
+        try:
+            query = f'pa="{applicant}" and txt="{molecule}"'
+            
+            response = await client.get(
+                "https://ops.epo.org/3.2/rest-services/published-data/search",
+                params={"q": query, "Range": "1-100"},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                search_result = data.get("ops:world-patent-data", {}).get("ops:biblio-search", {})
+                total = search_result.get("@total-result-count", 0)
+                
+                pub_refs = search_result.get("ops:search-result", {}).get("ops:publication-reference", [])
+                if not isinstance(pub_refs, list):
+                    pub_refs = [pub_refs] if pub_refs else []
+                
+                for ref in pub_refs:
+                    doc_id = ref.get("document-id", {})
+                    if isinstance(doc_id, list):
+                        doc_id = doc_id[0] if doc_id else {}
+                    
+                    country = doc_id.get("country", {}).get("$", "")
+                    number = doc_id.get("doc-number", {}).get("$", "")
+                    
+                    if country == "WO" and number:
+                        wo_numbers.add(f"WO{number}")
+                
+                logger.info(f"EPO '{applicant}': {total} results")
+            
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"EPO applicant search error: {e}")
+    
+    return wo_numbers
+
+# ============================================================
+# FASE 4: EPO FAMÍLIA - extrair BRs de cada WO
+# ============================================================
+async def get_epo_family_br(wo: str, token: str, client: httpx.AsyncClient) -> List[Dict]:
+    """Busca família de um WO e extrai patentes BR"""
+    br_patents = []
     
     try:
-        # Clean patent number
-        clean_num = re.sub(r'[^A-Z0-9]', '', patent_number.upper())
-        
-        # Family endpoint
-        url = f"https://ops.epo.org/3.2/rest-services/family/publication/docdb/{clean_num}/biblio"
+        clean_wo = re.sub(r'[^A-Z0-9]', '', wo.upper())
         
         response = await client.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            },
+            f"https://ops.epo.org/3.2/rest-services/family/publication/docdb/{clean_wo}/biblio",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             timeout=30.0
         )
         
         if response.status_code == 200:
             data = response.json()
+            family = data.get("ops:world-patent-data", {}).get("ops:patent-family", {})
+            members = family.get("ops:family-member", [])
             
-            # Parse family members
-            patent_family = data.get("ops:world-patent-data", {}).get("ops:patent-family", {})
-            family_members_raw = patent_family.get("ops:family-member", [])
+            if not isinstance(members, list):
+                members = [members] if members else []
             
-            if not isinstance(family_members_raw, list):
-                family_members_raw = [family_members_raw] if family_members_raw else []
-            
-            for member in family_members_raw:
+            for member in members:
                 pub_ref = member.get("publication-reference", {})
                 doc_id = pub_ref.get("document-id", {})
                 
@@ -227,460 +329,311 @@ async def get_epo_family(patent_number: str, token: str, client: httpx.AsyncClie
                     doc_id = doc_id[0] if doc_id else {}
                 
                 country = doc_id.get("country", {}).get("$", "")
-                doc_number = doc_id.get("doc-number", {}).get("$", "")
-                kind = doc_id.get("kind", {}).get("$", "")
+                number = doc_id.get("doc-number", {}).get("$", "")
                 
-                if country and doc_number:
-                    family_members.append({
-                        "country": country,
-                        "number": f"{country}{doc_number}",
-                        "kind": kind,
-                        "full_number": f"{country}-{doc_number}"
-                    })
+                if country == "BR" and number:
+                    # Extrair título
+                    title = ""
+                    try:
+                        bib = member.get("bibliographic-data", {})
+                        inv_title = bib.get("invention-title", [])
+                        if isinstance(inv_title, list) and inv_title:
+                            for t in inv_title:
+                                if t.get("@lang") == "pt" or t.get("@lang") == "en":
+                                    title = t.get("$", "")
+                                    break
+                            if not title:
+                                title = inv_title[0].get("$", "")
+                    except:
+                        pass
                     
-    except Exception as e:
-        logger.error(f"EPO family error for {patent_number}: {e}")
-    
-    return family_members
-
-# ============================================================
-# STEP 3: GOOGLE PATENTS SCRAPING (Stealth)
-# ============================================================
-async def scrape_google_patents(query: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Scraping stealth do Google Patents"""
-    patents = []
-    
-    try:
-        # Headers stealth
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        
-        # URL do Google Patents
-        url = f"https://patents.google.com/?q={query}&oq={query}"
-        
-        response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
-        
-        if response.status_code == 200:
-            html = response.text
-            
-            # Extrair patent IDs do HTML
-            # Padrão: /patent/WO2016162604 ou /patent/BR112017021636
-            patent_pattern = re.compile(r'/patent/([A-Z]{2}\d+[A-Z]?\d*)', re.IGNORECASE)
-            matches = patent_pattern.findall(html)
-            
-            seen = set()
-            for match in matches:
-                if match not in seen:
-                    seen.add(match)
-                    country = match[:2]
-                    patents.append({
-                        "country": country,
-                        "number": match,
-                        "source": "google_patents_scrape"
-                    })
-            
-            logger.info(f"Google Patents scrape '{query[:20]}...': {len(patents)} patents")
-            
-    except Exception as e:
-        logger.error(f"Google Patents scrape error: {e}")
-    
-    return patents
-
-async def get_google_patent_family(patent_id: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Busca família de patentes no Google Patents"""
-    family = []
-    
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        
-        url = f"https://patents.google.com/patent/{patent_id}"
-        response = await client.get(url, headers=headers, timeout=30.0, follow_redirects=True)
-        
-        if response.status_code == 200:
-            html = response.text
-            
-            # Procurar seção "Also published as" ou "Patent family"
-            # Padrão BR no HTML
-            br_pattern = re.compile(r'BR[-\s]?(\d{9,15}|\d{6,8})', re.IGNORECASE)
-            matches = br_pattern.findall(html)
-            
-            for match in matches:
-                br_num = f"BR{match}".replace(" ", "").replace("-", "")
-                family.append({
-                    "country": "BR",
-                    "number": br_num,
-                    "source": "google_patents_family"
-                })
-            
-            # Também procurar padrões mais específicos
-            br_full_pattern = re.compile(r'BR[-\s]?1[12][-\s]?\d{4}[-\s]?\d{6}[-\s]?\d', re.IGNORECASE)
-            full_matches = br_full_pattern.findall(html)
-            
-            for match in full_matches:
-                clean = re.sub(r'[^A-Z0-9]', '', match.upper())
-                if clean not in [f["number"] for f in family]:
-                    family.append({
-                        "country": "BR",
-                        "number": clean,
-                        "source": "google_patents_family"
-                    })
+                    # Extrair applicant
+                    applicant = ""
+                    try:
+                        parties = member.get("bibliographic-data", {}).get("parties", {})
+                        apps = parties.get("applicants", {}).get("applicant", [])
+                        if isinstance(apps, list) and apps:
+                            applicant = apps[0].get("applicant-name", {}).get("name", {}).get("$", "")
+                    except:
+                        pass
                     
+                    br_patents.append({
+                        "number": f"BR{number}",
+                        "wo_primary": wo,
+                        "title": title,
+                        "applicant": applicant,
+                        "source": "epo_family"
+                    })
+                    logger.info(f"  Family: BR{number} from {wo}")
     except Exception as e:
-        logger.error(f"Google Patents family error: {e}")
-    
-    return family
-
-# ============================================================
-# STEP 4: INPI CRAWLER
-# ============================================================
-async def search_inpi(terms: List[str], client: httpx.AsyncClient) -> List[Dict]:
-    """Busca direta no INPI usando múltiplos termos"""
-    br_patents = []
-    seen_numbers = set()
-    
-    for term in terms:
-        if not term or len(term) < 3:
-            continue
-            
-        try:
-            response = await client.get(
-                "https://crawler3-production.up.railway.app/api/data/inpi/patents",
-                params={"medicine": term},
-                timeout=60.0
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                for patent in data.get("data", []):
-                    title = patent.get("title", "")
-                    if title.startswith("BR") and title not in seen_numbers:
-                        seen_numbers.add(title)
-                        
-                        # Normalizar número
-                        clean_num = re.sub(r'\s+', '-', title)
-                        
-                        br_patents.append({
-                            "number": clean_num,
-                            "title": patent.get("applicant", ""),
-                            "filing_date": patent.get("depositDate", ""),
-                            "holder": patent.get("applicant", ""),
-                            "full_text": patent.get("fullText", ""),
-                            "source": "inpi_direct"
-                        })
-                        logger.info(f"INPI found: {clean_num} for '{term}'")
-            
-            await asyncio.sleep(1.0)  # Rate limiting INPI
-            
-        except Exception as e:
-            logger.error(f"INPI error for '{term}': {e}")
+        logger.error(f"EPO family error: {e}")
     
     return br_patents
 
 # ============================================================
-# STEP 5: ESPACENET SCRAPING
+# FASE 5: INPI SCRAPING DIRETO
 # ============================================================
-async def search_espacenet(query: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Busca no Espacenet (fallback)"""
+async def search_inpi(terms: List[str], client: httpx.AsyncClient) -> List[Dict]:
+    """Busca direta no INPI"""
     patents = []
+    seen = set()
     
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
+    for term in terms:
+        if not term or len(term) < 3:
+            continue
         
-        # Espacenet API endpoint
-        url = "https://worldwide.espacenet.com/3.2/rest-services/search"
-        
-        response = await client.get(
-            url,
-            params={"q": query, "ql": "cql"},
-            headers=headers,
-            timeout=30.0
-        )
-        
-        if response.status_code == 200:
-            # Parse response
-            data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-            logger.info(f"Espacenet search: {len(data)} results")
+        try:
+            # Tentar busca avançada do INPI
+            url = "https://busca.inpi.gov.br/pePI/servlet/PatenteServletController"
             
-    except Exception as e:
-        logger.error(f"Espacenet error: {e}")
+            response = await client.get(
+                url,
+                params={"Action": "SearchPatent", "Query": term},
+                headers=HEADERS,
+                timeout=60.0,
+                follow_redirects=True
+            )
+            
+            if response.status_code == 200:
+                html = response.text
+                
+                # Padrões para BR
+                patterns = [
+                    re.compile(r'BR\s*(\d{2})\s*(\d{4})\s*(\d{6})\s*(\d)', re.IGNORECASE),
+                    re.compile(r'(BR\d{12,15})', re.IGNORECASE),
+                ]
+                
+                for pattern in patterns:
+                    for match in pattern.finditer(html):
+                        if isinstance(match.groups()[0], tuple) or len(match.groups()) > 1:
+                            br_num = f"BR-{match.group(1)}-{match.group(2)}-{match.group(3)}-{match.group(4)}"
+                        else:
+                            br_num = match.group(1)
+                        
+                        if br_num not in seen:
+                            seen.add(br_num)
+                            patents.append({
+                                "number": br_num,
+                                "source": "inpi",
+                                "search_term": term
+                            })
+                
+                logger.info(f"INPI '{term}': {len([p for p in patents if p.get('search_term') == term])} patents")
+            
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"INPI error: {e}")
     
     return patents
 
 # ============================================================
 # DEDUPLICATION & CLASSIFICATION
 # ============================================================
-def normalize_br_number(number: str) -> str:
-    """Normaliza número de patente BR"""
-    # Remove espaços e caracteres especiais
-    clean = re.sub(r'[^A-Z0-9]', '', number.upper())
-    
-    # Formatar como BR-XXXXXXXXXX-X
-    if clean.startswith("BR") and len(clean) > 2:
+def normalize_br(num: str) -> str:
+    clean = re.sub(r'[^A-Z0-9]', '', num.upper())
+    if clean.startswith("BR") and len(clean) > 10:
         rest = clean[2:]
-        # Tentar formatar como BR 11 2024 016586 8
-        if len(rest) >= 13:
-            return f"BR-{rest[:2]}-{rest[2:6]}-{rest[6:12]}-{rest[12:]}"
-        elif len(rest) >= 7:
-            return f"BR-{rest}"
-    
-    return number
+        if len(rest) == 13:
+            return f"BR-{rest[:2]}-{rest[2:6]}-{rest[6:12]}-{rest[12]}"
+    return num
 
-def deduplicate_patents(patents: List[Dict]) -> List[Dict]:
-    """Remove duplicatas"""
+def deduplicate(patents: List[Dict]) -> List[Dict]:
     seen = {}
-    
     for p in patents:
-        num = p.get("number", "").upper()
-        num_clean = re.sub(r'[^A-Z0-9]', '', num)
-        
-        if not num_clean or len(num_clean) < 5:
-            continue
-        
-        if num_clean not in seen:
-            seen[num_clean] = p.copy()
-            seen[num_clean]["number_normalized"] = normalize_br_number(num)
-        else:
-            # Merge info
-            for key in ["title", "holder", "filing_date", "wo_primary"]:
-                if not seen[num_clean].get(key) and p.get(key):
-                    seen[num_clean][key] = p[key]
-            # Add sources
-            existing_source = seen[num_clean].get("source", "")
-            new_source = p.get("source", "")
-            if new_source and new_source not in existing_source:
-                seen[num_clean]["source"] = f"{existing_source},{new_source}" if existing_source else new_source
-    
+        key = re.sub(r'[^A-Z0-9]', '', p.get("number", "").upper())
+        if key and len(key) >= 8:
+            if key not in seen:
+                seen[key] = p.copy()
+            else:
+                for k in ["title", "applicant", "wo_primary"]:
+                    if not seen[key].get(k) and p.get(k):
+                        seen[key][k] = p[k]
     return list(seen.values())
 
-def classify_patent(patent: Dict) -> str:
-    """Classifica tipo de patente"""
-    text = (patent.get("title", "") + " " + patent.get("full_text", "")).lower()
-    
-    if any(w in text for w in ["cristalina", "crystalline", "polymorph", "crystal form"]):
+def classify(p: Dict) -> str:
+    text = (p.get("title", "") + " " + p.get("applicant", "")).lower()
+    if "cristal" in text or "polymorph" in text:
         return "CRYSTALLINE"
-    elif any(w in text for w in ["processo", "process", "synthesis", "preparation", "method of making"]):
+    elif "process" in text or "síntese" in text or "preparation" in text:
         return "PROCESS"
-    elif any(w in text for w in ["formulação", "formulation", "composition", "dosage"]):
+    elif "formulat" in text or "composition" in text:
         return "FORMULATION"
-    elif any(w in text for w in ["uso", "use", "treatment", "method of treatment", "therapy"]):
+    elif "uso" in text or "treatment" in text or "use" in text:
         return "MEDICAL_USE"
-    elif any(w in text for w in ["sal ", "salt", "salts"]):
-        return "SALT"
-    elif any(w in text for w in ["combinação", "combination"]):
+    elif "combinat" in text:
         return "COMBINATION"
-    elif any(w in text for w in ["intermediário", "intermediate"]):
-        return "INTERMEDIATE"
-    else:
-        return "OTHER"
+    return "OTHER"
 
 # ============================================================
-# MAIN SEARCH ENDPOINT
+# MAIN ENDPOINT
 # ============================================================
 @app.get("/api/v1/search/complete")
 async def complete_search(
-    molecule_name: str = Query(..., description="Nome da molécula (inglês)"),
-    molecule_name_pt: Optional[str] = Query(None, description="Nome em português"),
-    expected_br_count: int = Query(8, description="Número esperado de BRs (Cortellis benchmark)")
+    molecule_name: str = Query(..., description="Nome da molécula (apenas isso!)"),
+    expected_br_count: int = Query(8, description="Benchmark Cortellis")
 ):
     """
-    Busca COMPLETA de patentes BR
+    Busca completa AUTODESCOBERTA
     
-    Estratégia multi-fonte:
-    1. PubChem → dev codes, CAS
-    2. EPO OPS → busca + famílias de patentes
-    3. Google Patents Scraping → WOs e BRs
-    4. INPI Crawler → busca direta
+    A partir APENAS do nome da molécula, o sistema:
+    1. Descobre dev codes, CAS, nomes comerciais (PubChem)
+    2. Descobre fabricante (DrugBank)
+    3. Traduz para português automaticamente
+    4. Descobre applicants via primeira busca EPO
+    5. Faz segunda busca EPO com applicants descobertos
+    6. Busca família de cada WO → extrai BRs
+    7. Busca INPI com todos os termos descobertos
     """
-    start_time = datetime.now()
-    all_br_patents = []
-    all_wo_numbers = set()
-    sources_used = []
+    start = datetime.now()
     
-    async with httpx.AsyncClient() as client:
-        # ========== STEP 1: PUBCHEM ==========
-        logger.info(f"=== STEP 1: PubChem for {molecule_name} ===")
-        pubchem_data = await get_pubchem_data(molecule_name, client)
-        sources_used.append("pubchem")
+    async with httpx.AsyncClient(verify=False, timeout=60.0) as client:
+        # ========== FASE 1: ENRIQUECIMENTO ==========
+        logger.info(f"=== FASE 1: Enriquecimento para '{molecule_name}' ===")
         
-        # ========== STEP 2: EPO OPS ==========
-        logger.info(f"=== STEP 2: EPO OPS API ===")
+        # PubChem
+        pubchem = await enrich_from_pubchem(molecule_name, client)
+        
+        # DrugBank
+        drugbank = await scrape_drugbank(molecule_name, client)
+        
+        # Tradução automática
+        molecule_pt = await translate_to_portuguese(molecule_name, client)
+        
+        # Consolidar dados descobertos
+        discovered = {
+            "molecule_en": molecule_name,
+            "molecule_pt": molecule_pt,
+            "brand_name": drugbank.get("brand_name") or (pubchem["brand_names"][0] if pubchem["brand_names"] else None),
+            "manufacturer": drugbank.get("manufacturer"),
+            "dev_codes": pubchem["dev_codes"],
+            "cas": pubchem["cas"],
+            "synonyms": pubchem["synonyms"][:10]
+        }
+        
+        logger.info(f"Descoberto: {discovered}")
+        
+        # ========== FASE 2: EPO DESCOBERTA DE APPLICANTS ==========
+        logger.info(f"=== FASE 2: EPO Descoberta de Applicants ===")
+        
+        all_wo_numbers: Set[str] = set()
+        all_applicants: Set[str] = set()
+        all_br_patents: List[Dict] = []
+        
         epo_token = await get_epo_token(client)
         
         if epo_token:
-            sources_used.append("epo_ops")
+            wo_initial, applicants = await epo_search_discover_applicants(
+                molecule_name, 
+                pubchem["dev_codes"], 
+                epo_token, 
+                client
+            )
+            all_wo_numbers.update(wo_initial)
+            all_applicants.update(applicants)
             
-            # Buscar por nome da molécula
-            search_terms = [molecule_name]
-            if molecule_name_pt:
-                search_terms.append(molecule_name_pt)
-            search_terms.extend(pubchem_data["dev_codes"][:5])
+            # Adicionar manufacturer descoberto
+            if discovered["manufacturer"]:
+                all_applicants.add(discovered["manufacturer"])
             
-            epo_patents = []
-            for term in search_terms[:8]:
-                results = await search_epo(f'txt="{term}"', epo_token, client)
-                epo_patents.extend(results)
-                await asyncio.sleep(0.5)
+            logger.info(f"Applicants descobertos: {list(all_applicants)}")
             
-            # Separar WOs e BRs
-            for p in epo_patents:
-                if p["country"] == "WO":
-                    all_wo_numbers.add(p["number"])
-                elif p["country"] == "BR":
-                    all_br_patents.append({
-                        "number": p["full_number"],
-                        "source": "epo_search"
-                    })
+            # ========== FASE 3: EPO BUSCA EXPANDIDA ==========
+            logger.info(f"=== FASE 3: EPO Busca com Applicants ===")
             
-            logger.info(f"EPO found: {len(all_wo_numbers)} WOs, {len([p for p in epo_patents if p['country']=='BR'])} BRs")
+            wo_expanded = await epo_search_with_applicants(
+                molecule_name,
+                all_applicants,
+                epo_token,
+                client
+            )
+            all_wo_numbers.update(wo_expanded)
             
-            # Buscar famílias dos WOs encontrados
-            for wo in list(all_wo_numbers)[:15]:
-                family = await get_epo_family(wo, epo_token, client)
-                for member in family:
-                    if member["country"] == "BR":
-                        all_br_patents.append({
-                            "number": member["full_number"],
-                            "wo_primary": wo,
-                            "source": "epo_family"
-                        })
-                await asyncio.sleep(0.3)
-        
-        # ========== STEP 3: GOOGLE PATENTS SCRAPING ==========
-        logger.info(f"=== STEP 3: Google Patents Scraping ===")
-        sources_used.append("google_patents")
-        
-        gp_queries = [molecule_name]
-        if pubchem_data["dev_codes"]:
-            gp_queries.append(pubchem_data["dev_codes"][0])
-        
-        for query in gp_queries[:3]:
-            gp_results = await scrape_google_patents(query, client)
+            logger.info(f"Total WOs após expansão: {len(all_wo_numbers)}")
             
-            for p in gp_results:
-                if p["country"] == "WO":
-                    all_wo_numbers.add(p["number"])
-                elif p["country"] == "BR":
-                    all_br_patents.append({
-                        "number": p["number"],
-                        "source": "google_patents"
-                    })
+            # ========== FASE 4: EXTRAIR BRs DAS FAMÍLIAS ==========
+            logger.info(f"=== FASE 4: Extrair BRs de {len(all_wo_numbers)} WOs ===")
             
-            await asyncio.sleep(1.0)
+            for wo in sorted(all_wo_numbers)[:30]:
+                brs = await get_epo_family_br(wo, epo_token, client)
+                all_br_patents.extend(brs)
+                await asyncio.sleep(0.2)
         
-        # Buscar famílias dos WOs no Google Patents
-        for wo in list(all_wo_numbers)[:10]:
-            family = await get_google_patent_family(wo, client)
-            for member in family:
-                all_br_patents.append({
-                    "number": member["number"],
-                    "wo_primary": wo,
-                    "source": member.get("source", "google_patents_family")
-                })
-            await asyncio.sleep(0.5)
+        # ========== FASE 5: INPI DIRETO ==========
+        logger.info(f"=== FASE 5: INPI Direto ===")
         
-        # ========== STEP 4: INPI CRAWLER ==========
-        logger.info(f"=== STEP 4: INPI Crawler ===")
-        sources_used.append("inpi")
-        
-        inpi_terms = [molecule_name]
-        if molecule_name_pt:
-            inpi_terms.append(molecule_name_pt)
-        inpi_terms.extend(pubchem_data["dev_codes"][:7])
-        
-        # Adicionar sinônimos relevantes
-        for syn in pubchem_data["synonyms"][:5]:
-            if len(syn) > 5 and not any(c.isdigit() for c in syn[:3]):
-                inpi_terms.append(syn)
+        inpi_terms = [molecule_name, molecule_pt]
+        if discovered["brand_name"]:
+            inpi_terms.append(discovered["brand_name"])
+        inpi_terms.extend(pubchem["dev_codes"][:5])
         
         inpi_patents = await search_inpi(inpi_terms, client)
         all_br_patents.extend(inpi_patents)
         
-        # ========== STEP 5: DEDUPLICATION ==========
-        logger.info(f"=== STEP 5: Deduplication ===")
-        logger.info(f"Raw BR patents: {len(all_br_patents)}")
+        # ========== FASE 6: DEDUPLICAÇÃO ==========
+        logger.info(f"=== FASE 6: Deduplicação ===")
+        logger.info(f"Raw: {len(all_br_patents)} BRs")
         
-        unique_patents = deduplicate_patents(all_br_patents)
+        unique = deduplicate(all_br_patents)
         
-        # Classificar
-        for p in unique_patents:
-            p["patent_type"] = classify_patent(p)
+        for p in unique:
+            p["patent_type"] = classify(p)
+            p["number_normalized"] = normalize_br(p.get("number", ""))
         
-        # Ordenar
-        unique_patents.sort(key=lambda x: x.get("number", ""))
+        unique.sort(key=lambda x: x.get("number", ""))
         
-        elapsed = (datetime.now() - start_time).total_seconds()
+        elapsed = (datetime.now() - start).total_seconds()
         
-        # ========== RESULT ==========
         result = {
-            "molecule": molecule_name,
-            "molecule_pt": molecule_name_pt,
-            "timestamp": datetime.now().isoformat(),
-            "elapsed_seconds": round(elapsed, 2),
-            "pubchem_data": {
-                "cid": pubchem_data["cid"],
-                "dev_codes": pubchem_data["dev_codes"],
-                "cas": pubchem_data["cas"],
-                "synonyms_count": len(pubchem_data["synonyms"])
+            "input": {"molecule_name": molecule_name},
+            "autodiscovered": {
+                "molecule_pt": molecule_pt,
+                "brand_name": discovered["brand_name"],
+                "manufacturer": discovered["manufacturer"],
+                "dev_codes": discovered["dev_codes"],
+                "cas": discovered["cas"],
+                "applicants_found": sorted(list(all_applicants))
             },
             "search_stats": {
-                "sources_used": sources_used,
-                "wo_numbers_found": len(all_wo_numbers),
-                "wo_numbers": sorted(list(all_wo_numbers))[:20],
-                "raw_br_count": len(all_br_patents),
-                "unique_br_count": len(unique_patents)
+                "elapsed_seconds": round(elapsed, 2),
+                "wo_count": len(all_wo_numbers),
+                "wo_numbers": sorted(list(all_wo_numbers)),
+                "raw_br": len(all_br_patents),
+                "unique_br": len(unique)
             },
-            "cortellis_comparison": {
+            "cortellis": {
                 "expected": expected_br_count,
-                "found": len(unique_patents),
-                "match_rate": f"{min(len(unique_patents) / max(expected_br_count, 1) * 100, 150):.1f}%",
-                "status": (
-                    "✅ EXCELLENT" if len(unique_patents) >= expected_br_count else
-                    "🟡 GOOD" if len(unique_patents) >= expected_br_count * 0.75 else
-                    "🟠 PARTIAL" if len(unique_patents) >= expected_br_count * 0.5 else
-                    "🔴 NEEDS IMPROVEMENT"
-                )
+                "found": len(unique),
+                "rate": f"{min(len(unique)/max(expected_br_count,1)*100, 150):.1f}%",
+                "status": "✅ EXCELLENT" if len(unique) >= expected_br_count else
+                         "🟡 GOOD" if len(unique) >= expected_br_count * 0.75 else
+                         "🔴 NEEDS IMPROVEMENT"
             },
-            "br_patents": unique_patents
+            "br_patents": unique
         }
         
-        logger.info(f"=== COMPLETE: {len(unique_patents)} unique BR patents in {elapsed:.1f}s ===")
-        
+        logger.info(f"=== COMPLETE: {len(unique)} BR patents in {elapsed:.1f}s ===")
         return result
 
-# ============================================================
-# OTHER ENDPOINTS
-# ============================================================
 @app.get("/")
 async def root():
     return {
-        "service": "Pharmyrus V20",
-        "version": "20.0.0",
-        "description": "Patent search using EPO OPS + Stealth Crawlers + INPI",
-        "endpoints": {
-            "complete_search": "/api/v1/search/complete?molecule_name=darolutamide&molecule_name_pt=darolutamida",
-            "health": "/health"
-        }
+        "service": "Pharmyrus V22 - Autodescoberta",
+        "version": "22.0.0",
+        "description": "Sistema inteligente que descobre tudo automaticamente",
+        "usage": "/api/v1/search/complete?molecule_name=darolutamide",
+        "features": [
+            "Descobre dev codes e CAS via PubChem",
+            "Descobre fabricante via DrugBank",
+            "Traduz para português automaticamente",
+            "Descobre applicants via EPO",
+            "Busca expandida com applicants descobertos",
+            "INPI integrado"
+        ]
     }
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "version": "20.0.0",
-        "sources": ["pubchem", "epo_ops", "google_patents_scrape", "inpi_crawler"]
-    }
+    return {"status": "healthy", "version": "22.0.0"}
 
 if __name__ == "__main__":
     import uvicorn
